@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib, binascii
+import getpass
+import os
+import subprocess
+import urllib.parse
+import base64
+import sys
+
+BOTAN_CLI_BINARY = "botan"
+
+def check_botan_binary():
+    cmd = [BOTAN_CLI_BINARY, "version"]
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = p.communicate()
+        if p.returncode != 0:
+            error_message = ";".join([stdout, stderr])
+            raise Exception(
+                "Error during checking botan binary: '{}' ".format(error_message) + 
+                "Plase make sure that '{}' is installed and executable.".format(BOTAN_CLI_BINARY))
+    except FileNotFoundError:
+        print("Could not find botan cli: '{}' ".format(BOTAN_CLI_BINARY), file=sys.stderr)
+        print("Please make sure it is installed and executable.", file=sys.stderr)
+        sys.exit(1)
+
+def random_bytes(length):
+    return os.urandom(length)
+
+def to_hex(binary):
+    return binascii.hexlify(binary).decode().lower()
+
+def from_hex(hex_string):
+    return binascii.unhexlify(hex_string.encode())
+
+def kdf(password, iterations, salt):
+    key = hashlib.pbkdf2_hmac('sha256', password.encode('utf8'), salt, iterations)
+    return key
+
+def aes256_gcm_encrypt(data, key):
+    if len(key) != 32:
+        raise AssertionError("key must be 256 bit but key length is {}".format(len(key)))
+    
+    iv = random_bytes(12)
+
+    cmd = [
+        BOTAN_CLI_BINARY,
+        "encryption",
+        "--mode=aes-256-gcm",
+        "--iv={}".format(to_hex(iv)),
+        "--ad=",
+        "--key={}".format(to_hex(key))
+    ]
+
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    out_raw, stderr = p.communicate(input=data)
+    if p.returncode != 0:
+        raise Exception("Error during decryption: '{}'".format(stderr))
+
+    tag_length = 16
+    ciphertext = out_raw[0:-tag_length]
+    tag = out_raw[-tag_length:]
+    return iv, ciphertext, tag
+
+
+def aes256_gcm_decrypt(iv, ciphertext, tag, key):
+    if len(key) != 32:
+        raise AssertionError("key must be 256 bit but key length is {}".format(len(key)))
+
+    data = ciphertext + tag
+
+    cmd = [
+        BOTAN_CLI_BINARY,
+        "encryption",
+        "--decrypt",
+        "--mode=aes-256-gcm",
+        "--iv={}".format(to_hex(iv)),
+        "--ad=",
+        "--key={}".format(to_hex(key))
+    ]
+
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    out_raw, stderr = p.communicate(input=data)
+    if p.returncode != 0:
+        raise Exception("Error during decryption: '{}'".format(stderr))
+
+    return out_raw
+
+def main():
+    check_botan_binary()
+
+    parser = argparse.ArgumentParser(description='Encrypt a Lisk passphrase for your node.')
+    parser.add_argument('--decrypt',
+                        action='store_true',
+                        help='decrypt (default: false, i.e. encrypt)')
+
+    encryption_group = parser.add_argument_group('Encryption arguments')
+    encryption_group.add_argument('--generate-password',
+                        action='store_true',
+                        help='Auto generate an encryption password (default: ask the user)')
+    encryption_group.add_argument('--iterations',
+                        help='pbkdf2 iterations (default: 1,000,000)')
+    encryption_group.add_argument('--salt',
+                        help='hex encoded salt for pbkdf2 (default: auto generate)')
+    args = parser.parse_args()
+
+    if args.decrypt:
+        if args.salt:
+            print("--salt must not be set when decrypting", file=sys.stderr)
+            sys.exit(1)
+        if args.iterations:
+            print("--iterations must not be set when decrypting", file=sys.stderr)
+            sys.exit(1)
+        if args.generate_password:
+            print("--generate-password must not be set when decrypting", file=sys.stderr)
+            sys.exit(1)
+
+        encoded = sys.stdin.read().strip()
+        data = urllib.parse.parse_qs(encoded)
+        salt = from_hex(data["salt"][0])
+        iterations = int(data["iterations"][0])
+        iv = from_hex(data["iv"][0])
+        ciphertext = from_hex(data["cipherText"][0])
+        tag = from_hex(data["tag"][0])
+        if len(tag) != 16:
+            raise AssertionError("tag must be 128 bit but tag length is {}".format(len(tag)))
+
+        password = getpass.getpass()
+
+        key = kdf(password, iterations, salt)
+        plain_raw = aes256_gcm_decrypt(iv, ciphertext, tag, key)
+        print(plain_raw.decode())
+    else:
+        if args.iterations:
+            iterations = int(args.iterations)
+        else:
+            iterations = 1000000
+
+        if args.salt:
+            salt = from_hex(args.salt)
+        else:
+            salt = random_bytes(16)
+
+        if args.generate_password:
+            # Possible chars: 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~
+            # https://github.com/python/cpython/blob/master/Lib/base64.py#L423
+            password = base64.b85encode(random_bytes(32)).decode()
+        else:
+            password = getpass.getpass()
+        
+        print("Encrypting Lisk passphrase using password '{}'".format(password), file=sys.stderr)
+
+        key = kdf(password, iterations, salt)
+        # print(to_hex(key))
+
+        lisk_passphrase = sys.stdin.read().strip()
+
+        iv, ciphertext, tag = aes256_gcm_encrypt(lisk_passphrase.encode(), key)
+        # print(to_hex(iv), to_hex(ciphertext), to_hex(tag))
+
+        encoded = urllib.parse.urlencode({
+            "iterations": iterations,
+            "salt": to_hex(salt),
+            "cipherText": to_hex(ciphertext),
+            "iv": to_hex(iv),
+            "tag": to_hex(tag),
+            "version": 1,
+        })
+        print(encoded)
+
+
+if __name__ == "__main__":
+    main()
